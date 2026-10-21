@@ -1,0 +1,172 @@
+# Playxoft AI proxy
+
+> Every Playxoft project (spendchat, archivizz, xrbeezz, playxoft.com, clik.so) calls OpenAI, Anthropic (Claude) and Google Gemini through one proxy, https://ai-proxy.playxoft.com, instead of calling the providers directly. Projects keep the official SDKs and change only the base URL and the key: the project's proxy key `pxk_<project>_…`, stored as the server-side secret `PX_AI_KEY`. The proxy makes each call from a region the providers serve (US, EU, Mumbai, Singapore, Sydney), retries in the next region on location errors, 5xx or no answer, holds the provider keys encrypted, and enforces each project's allowed models, rate limit and monthly budget.
+
+This file is self-contained: the team docs at https://ai-proxy.playxoft.com/docs need a team sign-in (email and password) that AI tools can't pass. With a docs access token in `PX_DOCS_TOKEN` you can read the live docs instead (see "Live docs" below). Source of truth: `guides/llms.txt` in the `AI_Proxy_Playxoft` repo.
+
+Why it exists: Cloudflare Workers run in whichever data center the visitor reaches. In Hong Kong (for example Jio users in Chennai routed there) every provider refuses the call with "User location is not supported". The proxy's region Workers are pinned to supported regions, so calls work from anywhere.
+
+Rules for code that calls AI providers in a Playxoft project:
+
+- Never call `api.openai.com`, `api.anthropic.com` or `generativelanguage.googleapis.com` directly; use the proxy base URLs.
+- Server-side only. The proxy refuses browser calls (`403 px_browser_forbidden`, no CORS headers). Never put an AI key in browser code, client components, `NEXT_PUBLIC_` variables, Vite `define`, or mobile app builds.
+- Read `PX_AI_KEY` from the environment (`env.PX_AI_KEY` in a Cloudflare Worker, `process.env.PX_AI_KEY` in Node). Never hard-code, log or paste it, or put it on a command line. It lives in the project's Xecret environments (xecret.playxoft.com, the team's secret manager). Push it to a Worker with `xecret secrets get PX_AI_KEY --plain | npx wrangler secret put PX_AI_KEY` (add `--env <name>` per Wrangler environment). Locally use `xecret pull --format env -o .dev.vars` for `wrangler dev` (`.dev.vars` gitignored), or `xecret run -- npm run dev` for Node dev servers.
+- Always pass the key explicitly as `apiKey`; otherwise SDKs fall back to `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `GOOGLE_GENERATIVE_AI_API_KEY` and the proxy refuses the real key with `401`.
+- Log the `x-px-request-id` response header on every AI failure and quote it in bug reports.
+- Don't add region pinning or retry loops for location errors; the proxy fails over.
+- Projects, keys, allowed models, budgets and stored prompts are managed by the proxy owner with scripts in the `AI_Proxy_Playxoft` repo.
+- TypeScript only in code samples and project code.
+
+## Base URLs
+
+| Client | Base URL |
+|---|---|
+| OpenAI SDK (`openai`), Vercel `createOpenAI` | `https://ai-proxy.playxoft.com/api/openai/v1` |
+| Anthropic SDK (`@anthropic-ai/sdk`, appends `/v1` itself) | `https://ai-proxy.playxoft.com/api/anthropic` |
+| Vercel `createAnthropic`, raw HTTP to Anthropic | `https://ai-proxy.playxoft.com/api/anthropic/v1` |
+| Vercel `createGoogleGenerativeAI`, raw HTTP to Gemini | `https://ai-proxy.playxoft.com/api/gemini/v1beta` |
+| Google Gen AI SDK (`@google/genai`) | `httpOptions.baseUrl: 'https://ai-proxy.playxoft.com/api/gemini'` (no version; the SDK appends `/v1beta`) |
+| Any OpenAI-compatible client, all providers | `https://ai-proxy.playxoft.com/api/v1` with `openai/…`, `anthropic/…`, `google/…` model ids |
+
+- The key goes where the SDK normally puts it: `Authorization: Bearer` (OpenAI, unified), `x-api-key` (Anthropic), `x-goog-api-key` (Gemini). For raw Gemini calls use the `x-goog-api-key` header, never `?key=` in the URL: request URLs are logged.
+- Paths pass through unchanged: `/api/openai/v1/*` → `https://api.openai.com/v1/*`; `/api/anthropic/v1/*` → `https://api.anthropic.com/v1/*`; `/api/gemini/{v1beta,v1,v1alpha}/*` → `https://generativelanguage.googleapis.com/{version}/*`. Every model, streaming, tools, structured output, image input and image generation work.
+- Request bodies up to 25 MB. A new or rotated key takes a minute or two to work everywhere.
+
+## Code
+
+```ts
+import Anthropic from '@anthropic-ai/sdk';
+import { createAnthropic } from '@ai-sdk/anthropic';
+import { createGoogleGenerativeAI } from '@ai-sdk/google';
+import { createOpenAI } from '@ai-sdk/openai';
+import { GoogleGenAI } from '@google/genai';
+import { generateText } from 'ai';
+import OpenAI from 'openai';
+
+const PX = 'https://ai-proxy.playxoft.com';
+
+export function aiClients(pxAiKey: string) {
+  return {
+    openai: new OpenAI({ baseURL: `${PX}/api/openai/v1`, apiKey: pxAiKey }),
+    anthropic: new Anthropic({ baseURL: `${PX}/api/anthropic`, apiKey: pxAiKey }),
+    gemini: new GoogleGenAI({ apiKey: pxAiKey, httpOptions: { baseUrl: `${PX}/api/gemini`, timeout: 90_000 } }),
+    aiOpenai: createOpenAI({ baseURL: `${PX}/api/openai/v1`, apiKey: pxAiKey }),
+    aiAnthropic: createAnthropic({ baseURL: `${PX}/api/anthropic/v1`, apiKey: pxAiKey }),
+    aiGoogle: createGoogleGenerativeAI({ baseURL: `${PX}/api/gemini/v1beta`, apiKey: pxAiKey }),
+  };
+}
+
+export async function examples(pxAiKey: string): Promise<void> {
+  const c = aiClients(pxAiKey);
+
+  const { data, response } = await c.openai.responses.create({ model: 'gpt-5-mini', input: 'Say hi' }).withResponse();
+  console.log(data.output_text, response.headers.get('x-px-request-id'), response.headers.get('x-px-region-used'));
+
+  const claude = await c.anthropic.messages.create({ model: 'claude-opus-5', max_tokens: 1024, messages: [{ role: 'user', content: 'Say hi' }] });
+  console.log(claude.content);
+
+  const gem = await c.gemini.models.generateContent({ model: 'gemini-2.5-flash', contents: 'Say hi' });
+  console.log(gem.text, gem.sdkHttpResponse?.headers?.['x-px-request-id']);
+
+  const result = await generateText({ model: c.aiGoogle('gemini-2.5-flash'), prompt: 'Say hi' });
+  console.log(result.text, result.response.headers?.['x-px-request-id']);
+}
+```
+
+- `@google/genai`: a `baseUrl` ending in `/v1beta` doubles the version (Google `404`). File uploads (`ai.files.upload`) and the Live API don't work through the proxy; send media inline. Its `ApiError` has no headers; the proxy's `[px_…]` code is in `message`.
+- OpenAI and Anthropic SDK errors: `err.headers` holds `x-px-request-id` and `x-px-error` (a `Headers` object or a plain record, depending on SDK version). Vercel AI SDK errors: `APICallError.responseHeaders`.
+- Raw fetch to Gemini: `POST https://ai-proxy.playxoft.com/api/gemini/v1beta/models/gemini-2.5-flash:generateContent` with headers `x-goog-api-key: <PX_AI_KEY>` and `content-type: application/json`.
+
+## Bring your own key (BYOK)
+
+- For projects that keep their own provider key: the provider key goes in the SDK's normal key slot, the proxy key in an `x-px-key` header (`defaultHeaders` for the OpenAI and Anthropic SDKs, `headers` for the Vercel AI SDK, `httpOptions.headers` for `@google/genai`).
+- The project must allow it (`allowByok`), else `403 px_byok_not_allowed`. A provider key without `x-px-key` gets `401 px_unauthorized`: the proxy is never an open relay.
+- BYOK calls don't count toward the monthly budget and are never blocked by it; they count toward the rate limit and still obey the model allowlist.
+- On the unified endpoint send the key of the model's vendor in `Authorization: Bearer` plus `x-px-key`; a key that plainly belongs to another vendor (`sk-ant-…`, `AIza…`) gets `400 px_bad_request`.
+
+## Unified endpoint
+
+- `POST /api/v1/chat/completions` (text, image input, tools, streaming), `POST /api/v1/images/generations` (`openai/…`, `google/…` image models such as `google/gemini-2.5-flash-image` with `response_format: 'b64_json'`), `GET /api/v1/models` (models the project may use).
+- Model ids `openai/<model>`, `anthropic/<model>`, `google/<model>` (`gemini/` is an alias). Nothing is translated: each call goes to the provider's own OpenAI-compatible endpoint with the prefix stripped. Proxy errors use OpenAI's error shape.
+- `POST` only for chat and images (`405` otherwise); the body must be a JSON object; the query string isn't forwarded.
+- Anthropic through it uses Anthropic's OpenAI SDK compatibility layer, which Anthropic doesn't recommend for production: `response_format` is ignored (no JSON mode or structured output); `strict`, `reasoning_effort`, `logprobs`, `seed` ignored; `n` must be 1; on Claude 4.7 and later a `temperature` below 1 or a non-default `top_p` returns `400`; forced tool choice errors on Claude Opus 5.5, Sonnet 5.5, Fable 5.1 and Mythos 5.1; audio and PDF parts ignored; no prompt caching; thinking not returned; no image generation. For Claude in production use the native `/api/anthropic` path with the Anthropic SDK.
+- Google's OpenAI-compatible endpoint is still labelled beta; `reasoning_effort` takes `low`, `medium`, `high`, `none`.
+- `GET /api/v1/models` lists each provider's live models (for providers the project has a stored key for), prefixed `vendor/`, filtered by the allowlist. Failed providers are skipped and reported in a non-standard `px_errors` array.
+
+## Stored prompts
+
+- `x-px-prompt-id: <id>` uses the active version, `<id>@<version>` pins one. The stored prompt is added before any system prompt in the request: OpenAI chat → first `system` message; OpenAI Responses → `instructions`; Anthropic Messages → `system`; Gemini → first `systemInstruction` part; OpenAI-compatible chat and the unified endpoint → first `system` message.
+- Templates use `{{name}}` placeholders. Values come from the `x-px-prompt-vars` header (JSON object; `encodeURIComponent` it when not ASCII) and/or the body field `px_prompt_vars` (wins; always removed before forwarding). Values are strings, numbers or booleans.
+- Errors: `404 px_prompt_not_found`, `400 px_prompt_variables` (names the missing values), `400 px_not_supported` (endpoint doesn't take stored prompts).
+- Prompts are managed by the proxy owner (`prompt-put`, `prompt-list`, `prompt-activate`, `prompt-delete` scripts). They replace playxoft.com's `SYSTEM_PROMPT_1…20` environment variables.
+
+## Limits, budgets and usage
+
+- `allowedModels`: `vendor/model` patterns where `*` matches anything (including `/`), e.g. `openai/gpt-5-*`. Not allowed: `403 px_model_not_allowed`. `GET /api/v1/models` shows what is allowed. Every model a call names is checked: the body `model` (Gemini's too, as well as its path model), OpenAI realtime session and transcription models (`realtime/client_secrets`, `sessions`, `transcription_sessions`, `calls`, `calls/{id}/accept`) and `?model=` on `realtime`, `tools[].model` (OpenAI Responses, Anthropic), and every request of an Anthropic message batch. With a list the check fails closed: a `POST`, `PUT` or `PATCH` that names no model the proxy can read is refused the same way ("Can't tell which model this call uses"), so name the model in every call (a Responses `image_generation` tool with no `model` is refused too). Only calls that run no model may name none: OpenAI file, upload, batch, vector store, conversation and container calls, fine-tuning job cancel, pause and resume, `responses/{id}/cancel`, and realtime call hangup, refer and reject; Anthropic files and batch cancel; Gemini files, `cachedContents`, batch and operation cancels, `openai/files` and `openai/batches`. A model they do name is still checked. `GET`, `HEAD` and `DELETE` aren't refused for naming none. Also refused: a JSON body that repeats a top-level field, a multipart body with more than one `model` or `session` field, and multipart uploads over 8 MB (image edits, transcriptions; not read). Known gaps: models inside OpenAI batch input files, Gemini inline batch requests and OpenAI fine-tuning graders; repeated keys below the top level.
+- `rateLimit.perMinute`: sliding window over the whole project, BYOK included. Over: `429 px_rate_limited` with `retry-after` seconds.
+- `monthlyBudgetUsd`: UTC calendar months; only spend on the project's stored keys counts. Alerts at 80 % and 100 %. At 100 %: `429 px_budget_exceeded` with `x-should-retry: false` until the 1st (UTC) or a raise. Soft cap (can overshoot by about a minute of traffic). Budgets are optional: without one there is no spend limit (the default). A budget of 0 blocks every stored-key call; it never means unlimited.
+- Usage log per call: tokens, cost, latency, region, status, request id. Prompt and response text are stored only if the project turns on `logPrompts` (off by default). Replies of any size record tokens and cost: a large JSON reply (for example base64 images) isn't held whole; the proxy reads its top-level `usage` (Gemini: `usageMetadata`) as it streams by. Spend counts toward the month the call started in.
+
+## Regions and failover
+
+- Regions: `us` Virginia, `eu` Belgium, `in` Mumbai, `sg` Singapore, `au` Sydney. The router picks the one nearest to where the request arrived (South Asia → `in`; rest of Asia including Hong Kong and China → `sg`; Oceania → `au`; Europe, Africa, Middle East → `eu`; Americas and unknown → `us`).
+- Failover: on a provider location error, a 5xx, an unreachable region, or a stream with no headers within 20 s, the router retries once in the next-nearest allowed region. Normal 4xx errors are returned as they are. Nothing is retried after the reply has started. The 20 s limit applies to every streamed call; Gemini models that think for a long time may send headers late (`timeout` in `x-px-attempts`). Report it with the request id: the proxy owner can raise the limit.
+- `x-px-region: us|eu|in|sg|au` forces one region with no failover; rarely needed. A region outside the project's `allowedRegions`: `403 px_region_not_allowed`.
+
+## Headers
+
+- Request: `x-px-key` (proxy key for BYOK), `x-px-region`, `x-px-prompt-id`, `x-px-prompt-vars`. All `x-px-*` request headers are removed before forwarding.
+- Response: `x-px-request-id` (every response), `x-px-region-used`, `x-px-attempts` (`region:outcome[:status]`, comma-separated, e.g. `sg:location_error:403,in:ok:200`), `x-px-error` (proxy errors only), `x-px-upstream-ms`, `retry-after` (rate limit), `x-should-retry: false` (budget).
+
+## Error codes
+
+Provider errors pass through unchanged and have no `x-px-error` header. Proxy errors have `x-px-error` and the caller SDK's error shape: OpenAI `{ "error": { "message", "type": "px_…", "code": "px_…", "param": null } }`; Anthropic `{ "type": "error", "error": { "type": "permission_error", "message": "[px_…] …" } }`; Google `{ "error": { "code": 403, "message": "[px_…] …", "status": "PERMISSION_DENIED" } }`.
+
+- `px_bad_request` 400: bad `x-px-region`, unified body or model id, wrong-vendor BYOK key, bad prompt header or vars.
+- `px_unauthorized` 401: missing, invalid or revoked proxy key, or a provider key without `x-px-key`.
+- `px_unauthorized` 401 on `/api/docs/*` or the dashboard API: no team sign-in, or (on `/api/docs/*`) a missing, wrong, revoked or expired docs token.
+- `px_project_disabled` 403: project switched off.
+- `px_browser_forbidden` 403: call from a browser.
+- `px_byok_not_allowed` 403: own key sent, BYOK not allowed.
+- `px_provider_key_missing` 403: no stored key for this provider.
+- `px_model_not_allowed` 403: model not in the allowlist, or the proxy can't tell which model the call uses.
+- `px_region_not_allowed` 403: forced region not allowed.
+- `px_not_found` 404: wrong base URL or unsupported path.
+- `px_method_not_allowed` 405: wrong method on a unified endpoint.
+- `px_payload_too_large` 413: body over 25 MB.
+- `px_rate_limited` 429: project rate limit; wait `retry-after`.
+- `px_budget_exceeded` 429: monthly budget reached; don't retry.
+- `px_prompt_not_found` 404, `px_prompt_variables` 400, `px_not_supported` 400: stored prompt problems (or image generation with `anthropic/`).
+- `px_upstream_unreachable` 502: a region couldn't reach the provider.
+- `px_all_regions_failed` 502: every region tried failed.
+- `px_internal` 500: proxy problem; report the request id.
+
+## Troubleshooting
+
+- `401` "Send your proxy key in x-px-key…": the SDK sent a real provider key, usually because `apiKey` was undefined. Pass `PX_AI_KEY` explicitly.
+- `401` "Invalid proxy key": wrong, rotated or revoked key, or a brand new key not yet everywhere (wait a minute or two).
+- `404 px_not_found`: base URL missing its version (`/api/openai` instead of `/api/openai/v1`).
+- Anthropic `404` on `/v1/v1/messages`: the Anthropic SDK's `baseURL` ended in `/v1`; use `https://ai-proxy.playxoft.com/api/anthropic`.
+- Google `404` with `v1beta/v1beta` in the path: `@google/genai` `baseUrl` included the version.
+- "User location is not supported": the call didn't go through the proxy, or `x-px-region` forced a refused region.
+
+## Live docs
+
+If the environment has `PX_DOCS_TOKEN` (a read-only docs access token, `pxd_…`, that the proxy owner makes in the dashboard under Settings → Access tokens and keeps in Xecret), read the current docs with curl and a bearer header. WebFetch and other URL fetchers can't send the header, so they get `401`.
+
+```sh
+curl -sS -H "Authorization: Bearer $PX_DOCS_TOKEN" https://ai-proxy.playxoft.com/api/docs/llms.txt
+curl -sS -H "Authorization: Bearer $PX_DOCS_TOKEN" https://ai-proxy.playxoft.com/api/docs/pages
+curl -sS -H "Authorization: Bearer $PX_DOCS_TOKEN" https://ai-proxy.playxoft.com/api/docs/pages/quickstart.md
+```
+
+- `/api/docs/llms.txt`: this file, current. `/api/docs/pages`: every docs page as JSON (`slug`, `title`, `section`, `url`, `markdownUrl`). `/api/docs/pages/<slug>.md`: one page's Markdown; slugs can contain `/` (`migrations/playxoft-com`). `/api/docs/status`, `/api/docs/projects`: live region health, and each project's providers, allowed models, regions and limits (JSON, never keys).
+- Read-only: it can't change anything or call the AI APIs. Read the token from the environment; never print, log or paste it.
+- `401 px_unauthorized`: missing, wrong, revoked or expired token; ask the owner for a new one. `429 px_rate_limited`: too many wrong tokens from your network; wait `retry-after`. `503 px_unavailable`: try again shortly.
+- No token: use this file; it's self-contained.
+
+## Optional
+
+- [Team docs](https://ai-proxy.playxoft.com/docs/): the same material with more detail; needs the team sign-in (agents: the docs API above).
+- [Region status](https://ai-proxy.playxoft.com/docs/status/): live health of each region; needs the team sign-in (agents: `/api/docs/status`).
+- [Models by project](https://ai-proxy.playxoft.com/docs/models/): each project's providers, allowed models, regions, rate limit and budget; needs the team sign-in (agents: `/api/docs/projects`).

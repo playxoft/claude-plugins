@@ -1,0 +1,13 @@
+{
+  "name": "playxoft-ai-proxy",
+  "displayName": "Playxoft AI proxy",
+  "version": "1.6.0",
+  "description": "How Playxoft projects call OpenAI, Anthropic and Gemini through the Playxoft AI proxy (ai-proxy.playxoft.com): base URLs, PX_AI_KEY, BYOK, unified endpoint, stored prompts, headers, error codes and the live docs (PX_DOCS_TOKEN).",
+  "author": {
+    "name": "Playxoft"
+  },
+  "homepage": "https://github.com/playxoft/claude-plugins",
+  "repository": "https://github.com/playxoft/claude-plugins",
+  "license": "MIT",
+  "keywords": ["playxoft", "ai-proxy", "openai", "anthropic", "gemini"]
+}

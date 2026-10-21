@@ -1,0 +1,17 @@
+{
+  "name": "playxoft",
+  "description": "Claude Code plugins from Playxoft",
+  "owner": {
+    "name": "Playxoft"
+  },
+  "plugins": [
+    {
+      "name": "playxoft-ai-proxy",
+      "source": "./plugins/playxoft-ai-proxy",
+      "description": "Call OpenAI, Anthropic and Gemini through the Playxoft AI proxy",
+      "license": "MIT",
+      "homepage": "https://github.com/playxoft/claude-plugins",
+      "keywords": ["playxoft", "ai-proxy", "openai", "anthropic", "gemini"]
+    }
+  ]
+}
