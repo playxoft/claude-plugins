@@ -24,7 +24,10 @@ claude plugin install playxoft-ai-proxy@playxoft
 ```
 
 The repo is public, so this works on any machine with Claude Code. No GitHub
-account or access is needed.
+account or access is needed. If adding the marketplace fails with "SSH
+authentication failed", your machine has an SSH key GitHub doesn't accept;
+use the full URL instead:
+`/plugin marketplace add https://github.com/playxoft/claude-plugins.git`.
 
 - `--scope user` (the default) turns the plugin on in every project on your
   machine. `--scope project` turns it on for one repo by writing it into that
